@@ -48,6 +48,20 @@ class ReplicationThrottleHelper {
   // TOPIC resources are routed to a single broker, so an unbounded batch could produce an
   // oversized request on clusters with a very large number of topics.
   static final int MAX_RESOURCES_PER_ADMIN_REQUEST = 500;
+  // Backoff parameters for the config verification retry loop. The sleep between attempts is
+  // scale * base^attempt, capped at MAX_RETRY_SLEEP_MS so that a slow-to-verify config cannot
+  // park the executor thread for an unbounded exponential sleep.
+  static final long RETRY_BACKOFF_SCALE_MS = TimeUnit.SECONDS.toMillis(5);
+  static final int RETRY_BACKOFF_BASE = 2;
+  static final int MAX_RETRY_SLEEP_MS = (int) TimeUnit.SECONDS.toMillis(30);
+  // Config sources that a config entry can resolve from after a successful per-entity DELETE.
+  // Seeing one of these during verification means the delete itself worked; the value is
+  // inherited from a lower-precedence layer that CC does not manage.
+  private static final Set<ConfigEntry.ConfigSource> CONFIG_SOURCES_INHERITED_AFTER_DELETE = Collections.unmodifiableSet(
+      new HashSet<>(Arrays.asList(
+          ConfigEntry.ConfigSource.STATIC_BROKER_CONFIG,
+          ConfigEntry.ConfigSource.DYNAMIC_DEFAULT_BROKER_CONFIG,
+          ConfigEntry.ConfigSource.DEFAULT_CONFIG)));
 
   private final AdminClient _adminClient;
   private final Long _throttleRate;
@@ -490,7 +504,7 @@ class ReplicationThrottleHelper {
         Thread.currentThread().interrupt();
         return false;
       }
-    }, _retries);
+    }, RETRY_BACKOFF_SCALE_MS, RETRY_BACKOFF_BASE, _retries, MAX_RETRY_SLEEP_MS);
     if (!verified) {
       throw new IllegalStateException("The following configs were not applied within the time limit: " + pendingByResource);
     }
@@ -607,8 +621,13 @@ class ReplicationThrottleHelper {
         if (entry.getValue() != null) {
           return false;
         }
-      } else if (configEntry.source().equals(ConfigEntry.ConfigSource.STATIC_BROKER_CONFIG) && entry.getValue() == null) {
-        LOG.debug("Found static broker config: {}, skipping comparison", configEntry);
+      } else if (entry.getValue() == null && CONFIG_SOURCES_INHERITED_AFTER_DELETE.contains(configEntry.source())) {
+        // A deleted per-entity config can still resolve to a value inherited from a
+        // lower-precedence layer (static broker config, cluster-wide dynamic default, or the
+        // Kafka default). The deletion itself succeeded, so skip the comparison; otherwise
+        // verification of the delete would never converge (e.g. when a cluster-wide default
+        // replication throttle is set via kafka-configs --entity-default).
+        LOG.debug("Config {} resolves from {} after deletion, skipping comparison", configEntry, configEntry.source());
       } else if (!Objects.equals(entry.getValue(), configEntry.value())) {
         return false;
       }
