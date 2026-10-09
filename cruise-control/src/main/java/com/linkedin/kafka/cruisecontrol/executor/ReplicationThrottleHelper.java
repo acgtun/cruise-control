@@ -150,15 +150,50 @@ class ReplicationThrottleHelper {
       brokersToRemoveThrottlesFrom.removeAll(brokersWithInProgressTasks);
 
       LOG.info("Removing replica movement throttles from brokers in the cluster: {}", brokersToRemoveThrottlesFrom);
+      // Attempt every removal before surfacing a failure, so that a broker or topic whose throttle
+      // cannot be removed or verified does not leave the remaining throttles in place.
+      Exception firstFailure = null;
       for (int broker : brokersToRemoveThrottlesFrom) {
-        removeThrottledRateFromBroker(broker);
+        try {
+          removeThrottledRateFromBroker(broker);
+        } catch (ExecutionException | TimeoutException | IllegalStateException e) {
+          LOG.warn("Failed to remove throttle rate from broker {}; continuing with the remaining throttles", broker, e);
+          firstFailure = addFailure(firstFailure, e);
+        }
       }
 
       Map<String, Set<String>> throttledReplicas = getThrottledReplicasByTopic(completedProposals);
       for (Map.Entry<String, Set<String>> entry : throttledReplicas.entrySet()) {
-        removeThrottledReplicasFromTopic(entry.getKey(), entry.getValue());
+        try {
+          removeThrottledReplicasFromTopic(entry.getKey(), entry.getValue());
+        } catch (ExecutionException | TimeoutException | IllegalStateException e) {
+          LOG.warn("Failed to remove throttled replicas from topic {}; continuing with the remaining throttles", entry.getKey(), e);
+          firstFailure = addFailure(firstFailure, e);
+        }
+      }
+
+      if (firstFailure != null) {
+        rethrow(firstFailure);
       }
     }
+  }
+
+  private static Exception addFailure(Exception firstFailure, Exception failure) {
+    if (firstFailure == null) {
+      return failure;
+    }
+    firstFailure.addSuppressed(failure);
+    return firstFailure;
+  }
+
+  private static void rethrow(Exception failure) throws ExecutionException, TimeoutException {
+    if (failure instanceof ExecutionException) {
+      throw (ExecutionException) failure;
+    }
+    if (failure instanceof TimeoutException) {
+      throw (TimeoutException) failure;
+    }
+    throw (RuntimeException) failure;
   }
 
   private boolean throttlingEnabled() {

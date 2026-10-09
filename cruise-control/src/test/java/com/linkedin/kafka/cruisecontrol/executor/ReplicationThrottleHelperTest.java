@@ -197,6 +197,47 @@ public class ReplicationThrottleHelperTest extends CCKafkaIntegrationTestHarness
   }
 
   @Test
+  public void testClearThrottlesContinuesPastBrokerFailure() throws Exception {
+    final int partitionId = 0;
+    // A proposal to move a partition with 2 replicas from broker 0 and 1 to broker 0 and 2
+    ExecutionProposal proposal = new ExecutionProposal(new TopicPartition(TOPIC0, partitionId),
+                                                       100,
+                                                       new ReplicaPlacementInfo(0),
+                                                       Arrays.asList(new ReplicaPlacementInfo(0), new ReplicaPlacementInfo(1)),
+                                                       Arrays.asList(new ReplicaPlacementInfo(0), new ReplicaPlacementInfo(2)));
+
+    AdminClient mockAdminClient = EasyMock.mock(AdminClient.class);
+    ReplicationThrottleHelper throttleHelper = new ReplicationThrottleHelper(mockAdminClient, 100L);
+
+    // Broker 0's config read fails; brokers 1 and 2 have no throttle to remove.
+    ConfigResource broker0 = new ConfigResource(ConfigResource.Type.BROKER, "0");
+    DescribeConfigsResult failedDescribe = EasyMock.mock(DescribeConfigsResult.class);
+    KafkaFuture<Map<ConfigResource, Config>> failedFuture = EasyMock.mock(KafkaFuture.class);
+    EasyMock.expect(failedFuture.get(EasyMock.anyLong(), EasyMock.anyObject()))
+            .andThrow(new ExecutionException(new TimeoutException("broker 0 unreachable")));
+    EasyMock.expect(failedDescribe.all()).andReturn(failedFuture);
+    EasyMock.expect(mockAdminClient.describeConfigs(Collections.singletonList(broker0))).andReturn(failedDescribe);
+    EasyMock.replay(failedDescribe, failedFuture);
+    expectDescribeBrokerConfigs(mockAdminClient, Arrays.asList(1, 2), EMPTY_CONFIG);
+
+    // The topic-level throttled replicas are still removed and verified despite the broker failure.
+    String throttledReplicas = "0:0,0:1,0:2";
+    Config topicConfig = new Config(Arrays.asList(
+            new ConfigEntry(ReplicationThrottleHelper.LEADER_REPLICATION_THROTTLED_REPLICAS_CONFIG, throttledReplicas),
+            new ConfigEntry(ReplicationThrottleHelper.FOLLOWER_REPLICATION_THROTTLED_REPLICAS_CONFIG, throttledReplicas)));
+    expectDescribeTopicConfigs(mockAdminClient, TOPIC0, topicConfig, true);
+    expectIncrementalTopicConfigs(mockAdminClient, TOPIC0, true);
+    expectDescribeTopicConfigs(mockAdminClient, TOPIC0, EMPTY_CONFIG, true);
+    ExecutionTask mockCompleteTask = prepareMockCompleteTask(proposal);
+    EasyMock.replay(mockAdminClient);
+
+    // The broker failure is surfaced only after every other throttle has been cleared.
+    assertThrows(ExecutionException.class,
+                 () -> throttleHelper.clearThrottles(Collections.singletonList(mockCompleteTask), Collections.emptyList()));
+    EasyMock.verify(mockAdminClient, mockCompleteTask);
+  }
+
+  @Test
   public void testSetThrottleOnNonExistentTopic() throws Exception {
     final long throttleRate = 100L;
     final int brokerId0 = 0;
