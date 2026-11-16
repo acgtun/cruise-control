@@ -7,6 +7,7 @@ package com.linkedin.kafka.cruisecontrol.servlet.handler.sync;
 import com.linkedin.cruisecontrol.detector.AnomalyType;
 import com.linkedin.kafka.cruisecontrol.KafkaCruiseControl;
 import com.linkedin.kafka.cruisecontrol.executor.ConcurrencyType;
+import com.linkedin.kafka.cruisecontrol.servlet.UserRequestException;
 import com.linkedin.kafka.cruisecontrol.servlet.parameters.AdminParameters;
 import com.linkedin.kafka.cruisecontrol.servlet.parameters.ChangeExecutionConcurrencyParameters;
 import com.linkedin.kafka.cruisecontrol.servlet.parameters.DropRecentBrokersParameters;
@@ -39,6 +40,9 @@ public class AdminRequest extends AbstractSyncRequest {
    * partition and leadership concurrency and the interval between checking and updating
    * (if needed) the progress of an ongoing execution. Has no effect if Executor is in
    * {@link com.linkedin.kafka.cruisecontrol.executor.ExecutorState.State#NO_TASK_IN_PROGRESS} state.</li>
+   * <li>Dynamically change the replication throttle of an ongoing inter-broker partition movement. Rejected unless the
+   * Executor is in {@link com.linkedin.kafka.cruisecontrol.executor.ExecutorState.State#INTER_BROKER_REPLICA_MOVEMENT_TASK_IN_PROGRESS}
+   * state.</li>
    * <li>Enable/disable self-healing for the specified anomaly types.</li>
    * <li>Drop selected recently removed/demoted brokers.</li>
    * <li>Enable/disable the specified concurrency adjusters.</li>
@@ -158,6 +162,18 @@ public class AdminRequest extends AbstractSyncRequest {
       _kafkaCruiseControl.setRequestedMaxInterBrokerPartitionMovements(maxInterBrokerPartitionMovements);
       sb.append(String.format("Max inter-broker partition movements is set to %d%n", maxInterBrokerPartitionMovements));
       LOG.info("Max inter-broker partition movements is set to: {} by user.", maxInterBrokerPartitionMovements);
+    }
+    // 6. Change the replication throttle of the ongoing inter-broker partition movements.
+    Long replicationThrottle = changeExecutionConcurrencyParameters.replicationThrottle();
+    if (replicationThrottle != null) {
+      try {
+        _kafkaCruiseControl.setRequestedReplicationThrottle(replicationThrottle);
+      } catch (IllegalStateException e) {
+        throw new UserRequestException(e.getMessage());
+      }
+      sb.append(String.format("Replication throttle is set to %d bytes/sec; it applies at the next execution progress check%n",
+                              replicationThrottle));
+      LOG.info("Replication throttle of the ongoing execution is set to: {} bytes/sec by user.", replicationThrottle);
     }
 
     return sb.toString();

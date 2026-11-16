@@ -44,7 +44,7 @@ class ReplicationThrottleHelper {
   static final int RETRIES = 30;
 
   private final Admin _adminClient;
-  private final Long _throttleRate;
+  private Long _throttleRate;
   private final int _retries;
   private final Set<Integer> _deadBrokers;
 
@@ -69,6 +69,16 @@ class ReplicationThrottleHelper {
     this._throttleRate = throttleRate;
     this._retries = retries;
     this._deadBrokers = deadBrokers;
+  }
+
+  /**
+   * Change the rate that later calls to {@link #setThrottles(List)} apply. Not thread-safe: call it only from the thread
+   * that sets and clears the throttles.
+   *
+   * @param throttleRate The replication throttle in bytes/second.
+   */
+  void setThrottleRate(long throttleRate) {
+    _throttleRate = throttleRate;
   }
 
   void setThrottles(List<ExecutionProposal> replicaMovementProposals)

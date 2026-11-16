@@ -49,6 +49,7 @@ import java.util.HashSet;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeoutException;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import org.apache.kafka.clients.CommonClientConfigs;
 import org.apache.kafka.clients.admin.Admin;
@@ -65,6 +66,7 @@ import org.apache.kafka.common.Node;
 import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.TopicPartitionInfo;
+import org.apache.kafka.common.config.ConfigResource;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.utils.MockTime;
 import org.apache.kafka.common.utils.Time;
@@ -126,6 +128,38 @@ public class ExecutorTest extends CCKafkaClientsIntegrationTestHarness {
     } finally {
       KafkaCruiseControlUtils.closeAdminClientWithTimeout(adminClient);
     }
+  }
+
+  @Test
+  public void testChangeReplicationThrottleDuringExecution() throws OngoingExecutionException {
+    List<ExecutionProposal> proposalsToExecute = new ArrayList<>();
+    List<ExecutionProposal> proposalsToCheck = new ArrayList<>();
+    populateProposals(proposalsToExecute, proposalsToCheck, 0);
+    // A few MB across several records outlasts one replica fetch, so the initial throttle stalls TP0 until it is raised.
+    for (int i = 0; i < 8; i++) {
+      produceRandomDataToTopic(TOPIC0, 100_000);
+    }
+    long initialThrottle = 10_000L;
+    long changedThrottle = 100_000_000L;
+    executeAndVerifyProposals(proposalsToExecute, proposalsToCheck, false, initialThrottle, true, true, executor -> {
+      waitUntilTrue(() -> brokersHaveReplicationThrottle(initialThrottle),
+                    "The initial replication throttle was not set", EXECUTION_DEADLINE_MS, EXECUTION_SHORT_CHECK_MS);
+      executor.setRequestedReplicationThrottle(changedThrottle);
+      waitUntilTrue(() -> brokersHaveReplicationThrottle(changedThrottle),
+                    "The changed replication throttle was not applied to the ongoing execution",
+                    EXECUTION_DEADLINE_MS, EXECUTION_SHORT_CHECK_MS);
+    });
+  }
+
+  @Test
+  public void testSetRequestedReplicationThrottle() {
+    KafkaCruiseControlConfig config = new KafkaCruiseControlConfig(getExecutorProperties());
+    Executor executor = new Executor(config, null, new MetricRegistry(), null, EasyMock.mock(MetadataAdminClient.class),
+                                     null, EasyMock.mock(AnomalyDetectorManager.class));
+
+    assertThrows(IllegalArgumentException.class, () -> executor.setRequestedReplicationThrottle(0L));
+    // Rejected without an ongoing inter-broker replica movement.
+    assertThrows(IllegalStateException.class, () -> executor.setRequestedReplicationThrottle(PRODUCE_SIZE_IN_BYTES));
   }
 
   @Test
@@ -721,12 +755,37 @@ public class ExecutorTest extends CCKafkaClientsIntegrationTestHarness {
     return mockUserTaskInfo;
   }
 
+  private boolean brokersHaveReplicationThrottle(long throttle) {
+    List<ConfigResource> brokers = Arrays.asList(new ConfigResource(ConfigResource.Type.BROKER, String.valueOf(BROKER_ID_0)),
+                                                 new ConfigResource(ConfigResource.Type.BROKER, String.valueOf(BROKER_ID_1)));
+    try {
+      return _cluster.adminClient().describeConfigs(brokers).all().get().values().stream()
+                     .allMatch(config -> ReplicationThrottleHelper.configsEqual(config, Map.of(
+                         ReplicationThrottleHelper.LEADER_REPLICATION_THROTTLED_RATE_CONFIG, String.valueOf(throttle),
+                         ReplicationThrottleHelper.FOLLOWER_REPLICATION_THROTTLED_RATE_CONFIG, String.valueOf(throttle))));
+    } catch (InterruptedException | ExecutionException e) {
+      throw new IllegalStateException("Failed to describe broker configs.", e);
+    }
+  }
+
   private void executeAndVerifyProposals(Collection<ExecutionProposal> proposalsToExecute,
                                          Collection<ExecutionProposal> proposalsToCheck,
                                          boolean completeWithError,
                                          Long replicationThrottle,
                                          boolean verifyProgress,
                                          boolean isTriggeredByUserRequest)
+      throws OngoingExecutionException {
+    executeAndVerifyProposals(proposalsToExecute, proposalsToCheck, completeWithError, replicationThrottle,
+                              verifyProgress, isTriggeredByUserRequest, executor -> { });
+  }
+
+  private void executeAndVerifyProposals(Collection<ExecutionProposal> proposalsToExecute,
+                                         Collection<ExecutionProposal> proposalsToCheck,
+                                         boolean completeWithError,
+                                         Long replicationThrottle,
+                                         boolean verifyProgress,
+                                         boolean isTriggeredByUserRequest,
+                                         Consumer<Executor> duringExecution)
       throws OngoingExecutionException {
     KafkaCruiseControlConfig configs = new KafkaCruiseControlConfig(getExecutorProperties());
     UserTaskManager.UserTaskInfo mockUserTaskInfo = getMockUserTaskInfo();
@@ -769,6 +828,7 @@ public class ExecutorTest extends CCKafkaClientsIntegrationTestHarness {
       verifyOngoingPartitionReassignments(Collections.singleton(TP0));
       assertTrue("Concurrency adjuster is not started during execution", executor.isConcurrencyAdjusterStarted());
       assertTrue("Concurrency manager is not initialized during execution", executor.isConcurrencyManagerInitialized());
+      duringExecution.accept(executor);
     }
 
     waitUntilTrue(() -> (!executor.hasOngoingExecution() && executor.state().state() == ExecutorState.State.NO_TASK_IN_PROGRESS),
