@@ -430,6 +430,21 @@ public final class ParameterUtils {
     return value;
   }
 
+  /**
+   * Get the replication throttle requested for the ongoing execution. Unlike {@link #replicationThrottle}, this does not
+   * fall back to {@link ExecutorConfig#DEFAULT_REPLICATION_THROTTLE_CONFIG}.
+   *
+   * @param requestContext The request context.
+   * @return The requested replication throttle in bytes/second, or {@code null} if the request does not set one.
+   */
+  static Long ongoingExecutionReplicationThrottle(CruiseControlRequestContext requestContext) {
+    Long value = getLongParam(requestContext, REPLICATION_THROTTLE_PARAM, null);
+    if (value != null && value <= 0) {
+      throw new UserRequestException(String.format("Requested replication throttle must be positive (Requested: %s).", value));
+    }
+    return value;
+  }
+
   static Long time(CruiseControlRequestContext requestContext) {
     String parameterString = caseSensitiveParameterName(requestContext.getParameterMap(), TIME_PARAM);
     if (parameterString == null) {

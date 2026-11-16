@@ -54,6 +54,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import org.apache.kafka.clients.admin.Admin;
@@ -110,6 +111,8 @@ public class Executor {
 
   // Some state for external service to query
   private final AtomicInteger _stopSignal;
+  // Replication throttle requested for the ongoing inter-broker replica movement; consumed by the proposal execution thread.
+  private final AtomicReference<Long> _requestedReplicationThrottle;
   private final Time _time;
   private volatile boolean _hasOngoingExecution;
   private final Semaphore _flipOngoingExecutionMutex;
@@ -212,6 +215,7 @@ public class Executor {
     _latestRemoveStartTimeMsByBrokerId = new ConcurrentHashMap<>();
     _executorState = ExecutorState.noTaskInProgress(recentlyDemotedBrokers(), recentlyRemovedBrokers());
     _stopSignal = new AtomicInteger(NO_STOP_EXECUTION);
+    _requestedReplicationThrottle = new AtomicReference<>();
     _hasOngoingExecution = false;
     _flipOngoingExecutionMutex = new Semaphore(1);
     _noOngoingExecutionSemaphore = new Semaphore(1);
@@ -966,6 +970,26 @@ public class Executor {
   }
 
   /**
+   * Dynamically set the replication throttle of the ongoing inter-broker replica movement. The executor applies it at its
+   * next execution progress check, to the brokers and replicas of the in-progress movements and to every later batch of
+   * the same execution. It does not change {@link ExecutorConfig#DEFAULT_REPLICATION_THROTTLE_CONFIG} or later executions.
+   *
+   * @param requestedReplicationThrottle The replication throttle in bytes/second, for both leaders and followers.
+   */
+  public void setRequestedReplicationThrottle(long requestedReplicationThrottle) {
+    if (requestedReplicationThrottle <= 0) {
+      throw new IllegalArgumentException(String.format("Replication throttle must be positive (requested: %d).",
+                                                       requestedReplicationThrottle));
+    }
+    ExecutorState.State state = _executorState.state();
+    if (state != INTER_BROKER_REPLICA_MOVEMENT_TASK_IN_PROGRESS) {
+      throw new IllegalStateException(String.format("The replication throttle can only be changed while inter-broker replica "
+                                                    + "movement is in progress (executor state: %s).", state));
+    }
+    _requestedReplicationThrottle.set(requestedReplicationThrottle);
+  }
+
+  /**
    * Set the execution mode of the tasks to keep track of the ongoing execution mode via sensors.
    *
    * @param isKafkaAssignerMode {@code true} if kafka assigner mode, {@code false} otherwise.
@@ -1446,6 +1470,7 @@ public class Executor {
 
         // 1. Inter-broker move replicas if possible.
         if (_executorState.state() == STARTING_EXECUTION) {
+          _requestedReplicationThrottle.set(null);
           _executorState = ExecutorState.operationInProgress(INTER_BROKER_REPLICA_MOVEMENT_TASK_IN_PROGRESS,
                                                              _executionTaskManager.getExecutionTasksSummary(
                                                                  Collections.singleton(INTER_BROKER_REPLICA_ACTION)),
@@ -1627,7 +1652,7 @@ public class Executor {
           result = ExecutionUtils.submitReplicaReassignmentTasks(_adminClient, tasksToExecute);
         }
         // Wait indefinitely for partition movements to finish.
-        List<ExecutionTask> completedTasks = waitForInterBrokerReplicaTasksToFinish(result);
+        List<ExecutionTask> completedTasks = waitForInterBrokerReplicaTasksToFinish(result, throttleHelper);
         partitionsToMove = _executionTaskManager.numRemainingInterBrokerPartitionMovements();
         int numFinishedPartitionMovements = _executionTaskManager.numFinishedInterBrokerPartitionMovements();
         long finishedDataMovementInMB = _executionTaskManager.finishedInterBrokerDataMovementInMB();
@@ -1805,10 +1830,12 @@ public class Executor {
      * Periodically checks the metadata to see if inter-broker replica reassignment has finished or not.
      * @param result the result of a request to alter partition reassignments -- can be {@code null} if no new tasks
      *               for the execution are submitted.
+     * @param throttleHelper The helper that sets the replication throttle of this execution.
      *
      * @return Finished tasks.
      */
-    private List<ExecutionTask> waitForInterBrokerReplicaTasksToFinish(AlterPartitionReassignmentsResult result)
+    private List<ExecutionTask> waitForInterBrokerReplicaTasksToFinish(AlterPartitionReassignmentsResult result,
+                                                                       ReplicationThrottleHelper throttleHelper)
         throws InterruptedException, ExecutionException, TimeoutException {
       List<ExecutionTask> finishedTasks = new ArrayList<>();
       Set<Long> stoppedTaskIds = new HashSet<>();
@@ -1881,6 +1908,9 @@ public class Executor {
         sendSlowExecutionAlert(slowTasksToReport);
         handleDeadInterBrokerReplicaTasks(deadInterBrokerReplicaTasks, stoppedInterBrokerReplicaTasks);
         updateOngoingExecutionState();
+        if (_stopSignal.get() == NO_STOP_EXECUTION) {
+          maybeApplyRequestedReplicationThrottle(throttleHelper);
+        }
 
         retry = !inExecutionTasks().isEmpty() && finishedTasks.isEmpty();
         // If there is no finished tasks, we need to check if anything is blocked.
@@ -1910,6 +1940,28 @@ public class Executor {
       // Check to see if the task is done.
       finishedTasks.add(task);
       _executionTaskManager.markTaskDone(task);
+    }
+
+    /**
+     * Apply the replication throttle requested via {@link Executor#setRequestedReplicationThrottle(long)}, if any, to the in-progress
+     * inter-broker replica movements. Later batches pick it up through the same helper.
+     *
+     * @param throttleHelper The helper that sets the replication throttle of this execution.
+     */
+    private void maybeApplyRequestedReplicationThrottle(ReplicationThrottleHelper throttleHelper)
+        throws InterruptedException, ExecutionException, TimeoutException {
+      Long requestedReplicationThrottle = _requestedReplicationThrottle.getAndSet(null);
+      if (requestedReplicationThrottle == null) {
+        return;
+      }
+      List<ExecutionProposal> inProgressProposals =
+          _executionTaskManager.inExecutionTasks(Collections.singleton(INTER_BROKER_REPLICA_ACTION)).stream()
+                               .map(ExecutionTask::proposal)
+                               .collect(Collectors.toList());
+      LOG.info("User task {}: Changing the replication throttle to {} bytes/sec for {} in-progress inter-broker partition movements.",
+               _uuid, requestedReplicationThrottle, inProgressProposals.size());
+      throttleHelper.setThrottleRate(requestedReplicationThrottle);
+      throttleHelper.setThrottles(inProgressProposals);
     }
 
     /**

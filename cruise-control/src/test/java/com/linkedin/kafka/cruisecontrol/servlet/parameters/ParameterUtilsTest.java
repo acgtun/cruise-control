@@ -7,6 +7,7 @@ package com.linkedin.kafka.cruisecontrol.servlet.parameters;
 import com.linkedin.cruisecontrol.http.CruiseControlRequestContext;
 import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
 import com.linkedin.kafka.cruisecontrol.config.constants.ExecutorConfig;
+import com.linkedin.kafka.cruisecontrol.servlet.UserRequestException;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
@@ -137,6 +138,25 @@ public class ParameterUtilsTest {
     Long replicationThrottle = ParameterUtils.replicationThrottle(mockRequest, controlConfig);
     Assert.assertEquals(Long.valueOf(DEFAULT_REPLICATION_THROTTLE_STRING), replicationThrottle);
     EasyMock.verify(mockRequest, controlConfig);
+  }
+
+  @Test
+  public void testParseOngoingExecutionReplicationThrottle() {
+    CruiseControlRequestContext mockRequest = EasyMock.mock(CruiseControlRequestContext.class);
+    Map<String, String[]> paramMap = Collections.singletonMap(
+        ParameterUtils.REPLICATION_THROTTLE_PARAM,
+        new String[]{ParameterUtils.REPLICATION_THROTTLE_PARAM});
+
+    EasyMock.expect(mockRequest.getParameterMap()).andReturn(Collections.emptyMap()).andReturn(paramMap).times(2);
+    EasyMock.expect(mockRequest.getParameter(ParameterUtils.REPLICATION_THROTTLE_PARAM))
+            .andReturn(REPLICATION_THROTTLE_STRING).andReturn("0");
+    EasyMock.replay(mockRequest);
+
+    // No fallback to the default replication throttle.
+    Assert.assertNull(ParameterUtils.ongoingExecutionReplicationThrottle(mockRequest));
+    Assert.assertEquals(Long.valueOf(REPLICATION_THROTTLE_STRING), ParameterUtils.ongoingExecutionReplicationThrottle(mockRequest));
+    Assert.assertThrows(UserRequestException.class, () -> ParameterUtils.ongoingExecutionReplicationThrottle(mockRequest));
+    EasyMock.verify(mockRequest);
   }
 
   @Test

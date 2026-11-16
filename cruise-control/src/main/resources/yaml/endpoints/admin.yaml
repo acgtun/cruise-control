@@ -45,6 +45,13 @@ AdminEndpoint:
           type: integer
           format: int32
           minimum: 1
+      - name: replication_throttle
+        in: query
+        description: Change the replication throttle (bytes per second) of the ongoing inter broker partition movements.
+        schema:
+          type: integer
+          format: int64
+          minimum: 1
       - name: concurrent_intra_broker_partition_movements
         in: query
         description: Change upper bound of ongoing replica movements between disks within each broker.

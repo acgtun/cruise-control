@@ -516,6 +516,15 @@ public class KafkaCruiseControl {
   }
 
   /**
+   * Dynamically set the replication throttle of the ongoing inter-broker replica movement.
+   *
+   * @param requestedReplicationThrottle The replication throttle in bytes/second.
+   */
+  public void setRequestedReplicationThrottle(long requestedReplicationThrottle) {
+    _executor.setRequestedReplicationThrottle(requestedReplicationThrottle);
+  }
+
+  /**
    * Resume the activities of the load monitor.
    *
    * @param reason The reason for resuming metric sampling.
